@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/rcrowley/go-metrics"
@@ -50,10 +51,18 @@ func SetLogger(l zap.Logger) {
 
 // TResponse represents response from telegram
 type TResponse struct {
-	Ok          bool            `json:"ok"`
-	Result      json.RawMessage `json:"result,omitempty"`
-	ErrorCode   int64           `json:"error_code,omitempty"`
-	Description string          `json:"description"`
+	Ok     bool            `json:"ok"`
+	Result json.RawMessage `json:"result,omitempty"`
+	TError
+}
+
+type TError struct {
+	ErrorCode   int64  `json:"error_code,omitempty"`
+	Description string `json:"description"`
+}
+
+func (t TError) Error() string {
+	return fmt.Sprintf("code:%d description:%q", t.ErrorCode, t.Description)
 }
 
 // TUpdate represents an update event from telegram
@@ -64,24 +73,62 @@ type TUpdate struct {
 
 // TMessage is Telegram incomming message
 type TMessage struct {
-	MessageID       int64     `json:"message_id"`
-	From            TUser     `json:"from"`
-	Date            int64     `json:"date"`
-	Chat            TChat     `json:"chat"`
-	Text            string    `json:"text"`
-	ParseMode       string    `json:"parse_mode,omitempty"`
-	MigrateToChatID *int64    `json:"migrate_to_chat_id,omitempty"`
-	ReplyTo         *TMessage `json:"reply_to_message,omitempty"`
-	NewChatMember   TUser     `json:"new_chat_member,omitempty"`
-	LeftChatMember  TUser     `json:"left_chat_member,omitempty"`
-	ReceivedAt      time.Time `json:"-"`
+	MessageID       int64           `json:"message_id"`
+	From            TUser           `json:"from"`
+	Date            int64           `json:"date"`
+	Chat            TChat           `json:"chat"`
+	Text            string          `json:"text"`
+	ParseMode       string          `json:"parse_mode,omitempty"`
+	MigrateToChatID *int64          `json:"migrate_to_chat_id,omitempty"`
+	ReplyTo         *TMessage       `json:"reply_to_message,omitempty"`
+	NewChatMember   *TUser          `json:"new_chat_member,omitempty"`
+	LeftChatMember  *TUser          `json:"left_chat_member,omitempty"`
+	ReceivedAt      time.Time       `json:"-"`
+	Raw             json.RawMessage `json:"-"`
+}
+
+func (m *TMessage) toMessage() *Message {
+	message := Message{
+		ID: strconv.FormatInt(m.MessageID, 10),
+		From: User{
+			ID:        strconv.FormatInt(m.From.ID, 10),
+			FirstName: m.From.FirstName,
+			LastName:  m.From.LastName,
+			Username:  m.From.Username,
+		},
+		Date: time.Unix(m.Date, 0),
+		Chat: Chat{
+			ID:       strconv.FormatInt(m.Chat.ID, 10),
+			Type:     TChatTypeMap[m.Chat.Type],
+			Title:    m.Chat.Title,
+			Username: m.Chat.Username,
+		},
+		Text:       m.Text,
+		ReceivedAt: m.ReceivedAt,
+		Raw:        m.Raw,
+	}
+
+	return &message
+}
+
+func (m *TMessage) toMigratedMessage() ChannelMigratedMessage {
+	fromID := strconv.FormatInt(m.Chat.ID, 10)
+	toID := strconv.FormatInt(*(m.MigrateToChatID), 10)
+
+	return ChannelMigratedMessage{
+		FromID:     fromID,
+		ToID:       toID,
+		ReceivedAt: m.ReceivedAt,
+		Raw:        m.Raw,
+	}
 }
 
 // TOutMessage is Telegram outgoing message
 type TOutMessage struct {
-	ChatID    string `json:"chat_id"`
-	Text      string `json:"text"`
-	ParseMode string `json:"parse_mode,omitempty"`
+	ChatID           string `json:"chat_id"`
+	Text             string `json:"text"`
+	ParseMode        string `json:"parse_mode,omitempty"`
+	ReplyToMessageID *int64 `json:"reply_to_message_id,omitempty"`
 }
 
 // TUser is Telegram User
@@ -115,6 +162,7 @@ var TChatTypeMap = map[string]ChatType{
 
 // Telegram API
 type Telegram struct {
+	Name       string
 	url        string
 	input      map[Plugin]chan interface{}
 	output     chan Message
@@ -127,12 +175,14 @@ func NewTelegram(key string) *Telegram {
 	if key == "" {
 		log.Fatal("telegram API key must not be empty")
 	}
-	return &Telegram{
+	t := Telegram{
 		url:    fmt.Sprintf("https://api.telegram.org/bot%s", key),
 		input:  make(map[Plugin]chan interface{}),
 		output: make(chan Message, OutboxBufferSize),
 		quit:   make(chan struct{}),
 	}
+
+	return &t
 }
 
 //AddPlugin add processing module to telegram
@@ -190,6 +240,14 @@ func (t *Telegram) poolOutbox() {
 						Text:      m.Text,
 						ParseMode: string(m.Format),
 					}
+					if m.ReplyToID != "" {
+						id, err := strconv.ParseInt(m.ReplyToID, 10, 64)
+						if err != nil {
+							log.Error("failed to parse ReplyToID", zap.Error(err))
+							continue
+						}
+						outMsg.ReplyToMessageID = &id
+					}
 
 					var b bytes.Buffer
 					if err := json.NewEncoder(&b).Encode(outMsg); err != nil {
@@ -199,7 +257,7 @@ func (t *Telegram) poolOutbox() {
 					started := time.Now()
 					jsonMsg := b.String()
 
-					var tresp TResponse
+					var tresp *TResponse
 					var err error
 					retries := m.Retry
 					for {
@@ -323,44 +381,27 @@ func (t *Telegram) parseInbox(resp *http.Response) (int, error) {
 		var m TMessage
 		json.Unmarshal(update.Message, &m)
 		t.lastUpdate = update.UpdateID
+		m.ReceivedAt = receivedAt
+		m.Raw = update.Message
 
 		var msg interface{}
-		message := Message{
-			ID: strconv.FormatInt(m.MessageID, 10),
-			From: User{
-				ID:        strconv.FormatInt(m.From.ID, 10),
-				FirstName: m.From.FirstName,
-				LastName:  m.From.LastName,
-				Username:  m.From.Username,
-			},
-			Date: time.Unix(m.Date, 0),
-			Chat: Chat{
-				ID:       strconv.FormatInt(m.Chat.ID, 10),
-				Type:     TChatTypeMap[m.Chat.Type],
-				Title:    m.Chat.Title,
-				Username: m.Chat.Username,
-			},
-			Text:       m.Text,
-			ReceivedAt: receivedAt,
-			Raw:        update.Message,
+		switch {
+		case m.MigrateToChatID != nil:
+			msg = m.toMigratedMessage()
+		case m.NewChatMember != nil:
+			msg = &JoinMessage{m.toMessage()}
+		case m.LeftChatMember != nil:
+			msg = &LeftMessage{m.toMessage()}
+		default:
+			msg = m.toMessage()
 		}
-		if m.MigrateToChatID != nil {
-			newChanID := strconv.FormatInt(*(m.MigrateToChatID), 10)
-			chanMigratedMsg := ChannelMigratedMessage{
-				Message:    message,
-				FromID:     message.Chat.ID,
-				ToID:       newChanID,
-				ReceivedAt: receivedAt,
-			}
-			msg = &chanMigratedMsg
-		}
-		msg = &message
+
 		log.Debug("update", zap.Object("msg", msg))
 		for plugin, ch := range t.input {
 			select {
 			case ch <- msg:
 			default:
-				log.Warn("input channel full, skipping message", zap.String("plugin", plugin.Name()), zap.String("msgID", message.ID))
+				log.Warn("input channel full, skipping message", zap.String("plugin", plugin.Name()), zap.Int64("msgID", m.MessageID))
 			}
 		}
 	}
@@ -368,89 +409,95 @@ func (t *Telegram) parseInbox(resp *http.Response) (int, error) {
 	return len(results), nil
 }
 
-func (t *Telegram) Leave(chanID string) error {
-	url := fmt.Sprintf("%s/leaveChat?chat_id=%s", t.url, url.QueryEscape(chanID))
-	resp, err := http.Get(url)
+func (t *Telegram) Chat(chanID string) (*TChat, error) {
+	url := fmt.Sprintf("getChat?chat_id=%s", url.QueryEscape(chanID))
+	resp, err := t.do(url)
 	if err != nil {
-		log.Error("leave failed", zap.Error(err))
-		return err
-	}
-	defer resp.Body.Close()
-
-	if _, err := parseResponse(resp); err != nil {
-		log.Error("leave invalid response", zap.Error(err))
-		return err
+		return nil, err
 	}
 
-	return nil
+	var chat TChat
+	if err := json.Unmarshal(resp.Result, &chat); err != nil {
+		return nil, err
+	}
+
+	return &chat, nil
+}
+
+func (t *Telegram) Leave(chanID string) error {
+	url := fmt.Sprintf("leaveChat?chat_id=%s", url.QueryEscape(chanID))
+	_, err := t.do(url)
+
+	return err
 }
 
 func (t *Telegram) Member(chanID, userID string) (*TChatMember, error) {
-	url := fmt.Sprintf("%s/getChatmember?chat_id=%s&user_id=%s", t.url, url.QueryEscape(chanID), url.QueryEscape(userID))
-	resp, err := http.Get(url)
+	url := fmt.Sprintf("getChatmember?chat_id=%s&user_id=%s", url.QueryEscape(chanID), url.QueryEscape(userID))
+	resp, err := t.do(url)
 	if err != nil {
-		log.Error("get member failed", zap.Error(err))
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	tresp, err := parseResponse(resp)
-	if err != nil {
-		log.Error("get member invalid response", zap.Error(err))
 		return nil, err
 	}
 
 	var member TChatMember
-	if err := json.Unmarshal(tresp.Result, &member); err != nil {
+	if err := json.Unmarshal(resp.Result, &member); err != nil {
 		return nil, err
 	}
 
 	return &member, nil
 }
 
-func (t *Telegram) Kick(chanID, userID string) error {
-	url := fmt.Sprintf("%s/kickChatMember?chat_id=%s&user_id=%s", t.url, url.QueryEscape(chanID), url.QueryEscape(userID))
-	resp, err := http.Get(url)
+func (t *Telegram) MembersCount(chanID string) (int, error) {
+	url := fmt.Sprintf("getChatMembersCount?chat_id=%s", url.QueryEscape(chanID))
+	resp, err := t.do(url)
 	if err != nil {
-		log.Error("kick failed", zap.Error(err))
-		return err
-	}
-	defer resp.Body.Close()
-
-	if _, err := parseResponse(resp); err != nil {
-		log.Error("kick invalid response", zap.Error(err))
-		return err
+		return 0, err
 	}
 
-	return nil
+	var n int
+	err = json.Unmarshal(resp.Result, &n)
+
+	return n, err
+}
+
+func (t *Telegram) Kick(chanID, userID string) error {
+	url := fmt.Sprintf("kickChatMember?chat_id=%s&user_id=%s", url.QueryEscape(chanID), url.QueryEscape(userID))
+	_, err := t.do(url)
+	return err
 }
 
 func (t *Telegram) Unban(chanID, userID string) error {
-	url := fmt.Sprintf("%s/unbanChatMember?chat_id=%s&user_id=%s", t.url, url.QueryEscape(chanID), url.QueryEscape(userID))
+	url := fmt.Sprintf("unbanChatMember?chat_id=%s&user_id=%s", url.QueryEscape(chanID), url.QueryEscape(userID))
+	_, err := t.do(url)
+	return err
+}
+
+func (t *Telegram) do(urlPath string) (*TResponse, error) {
+	url := fmt.Sprintf("%s/%s", t.url, urlPath)
 	resp, err := http.Get(url)
 	if err != nil {
-		log.Error("kick failed", zap.Error(err))
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
-	if _, err := parseResponse(resp); err != nil {
-		log.Error("kick invalid response", zap.Error(err))
-		return err
-	}
-
-	return nil
+	return parseResponse(resp)
 }
 
-func parseResponse(resp *http.Response) (TResponse, error) {
-
+func parseResponse(resp *http.Response) (*TResponse, error) {
 	var tresp TResponse
 	if err := json.NewDecoder(resp.Body).Decode(&tresp); err != nil {
-		return tresp, fmt.Errorf("decoding response failed %s", err)
+		return nil, fmt.Errorf("decoding response failed %s", err)
 	}
 	if !tresp.Ok {
-		return tresp, fmt.Errorf("code:%d description:%s", tresp.ErrorCode, tresp.Description)
+		return nil, tresp.TError
 	}
 
-	return tresp, nil
+	return &tresp, nil
+}
+
+func Sscape(s string) string {
+	s = strings.Replace(s, "&", "&amp;", -1)
+	s = strings.Replace(s, "<", "&lt;", -1)
+	s = strings.Replace(s, ">", "&gt;", -1)
+
+	return s
 }

@@ -8,24 +8,32 @@ import (
 
 // Message represents chat message
 type Message struct {
-	ID             string
-	From           User
-	Date           time.Time
-	Chat           Chat
-	Text           string
-	Format         MessageFormat
-	ReplyMessageID string
-	ReceivedAt     time.Time
-	Raw            json.RawMessage `json:"-"`
-	Retry          int             `json:"-"`
-	DiscardAfter   time.Time       `json:"-"`
+	ID           string
+	From         User
+	Date         time.Time
+	Chat         Chat
+	Text         string
+	Format       MessageFormat
+	ReplyToID    string
+	ReceivedAt   time.Time
+	Raw          json.RawMessage `json:"-"`
+	Retry        int             `json:"-"`
+	DiscardAfter time.Time       `json:"-"`
+}
+
+type JoinMessage struct {
+	*Message
+}
+
+type LeftMessage struct {
+	*Message
 }
 
 type ChannelMigratedMessage struct {
-	Message
 	FromID     string
 	ToID       string
 	ReceivedAt time.Time
+	Raw        json.RawMessage `json:"-"`
 }
 
 // MessageFormat represents formatting of the message
